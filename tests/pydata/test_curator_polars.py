@@ -380,6 +380,47 @@ def test_polars_schema_coerce_with_check_columns(as_frame):
     assert curator.dataset.collect_schema()["pl_no_cast_str"] == pl.String
 
 
+def test_polars_column_rules_and_parquet_sorting_metadata(as_frame):
+    import pyarrow.parquet as pq
+
+    schema = make_schema(
+        [
+            ("pl_rule_id", str, {"unique": True, "regex": r"^ID-[0-9]+$"}),
+            ("pl_rule_group", str, {}),
+            ("pl_rule_rank", int, {}),
+        ],
+        unique=["pl_rule_group", "pl_rule_rank"],
+        sorted_by=["pl_rule_group", ("pl_rule_rank", False)],
+    )
+    df = pl.DataFrame(
+        {
+            "pl_rule_id": ["ID-1", "ID-2", "ID-3", "ID-4"],
+            "pl_rule_group": ["a", "a", "b", "b"],
+            "pl_rule_rank": [2, 1, 2, 1],
+        }
+    )
+    curator = ln.curators.DataFrameCurator(as_frame(df), schema)
+    curator.validate()
+    assert isinstance(curator.dataset, type(as_frame(df)))
+    artifact = curator.save_artifact(
+        key=f"polars/rules-{type(curator.dataset).__name__}.parquet"
+    )
+    metadata = pq.ParquetFile(artifact.path).metadata
+    assert list(metadata.row_group(0).sorting_columns) == [
+        pq.SortingColumn(1, descending=False, nulls_first=False),
+        pq.SortingColumn(2, descending=True, nulls_first=False),
+    ]
+
+    invalid_frames = [
+        df.with_columns(pl.Series("pl_rule_id", ["ID-1", "ID-1", "ID-3", "ID-4"])),
+        df.with_columns(pl.Series("pl_rule_id", ["invalid", "ID-2", "ID-3", "ID-4"])),
+        df.with_columns(pl.Series("pl_rule_rank", [1, 2, 2, 1])),
+    ]
+    for invalid in invalid_frames:
+        with pytest.raises(ValidationError):
+            ln.curators.DataFrameCurator(as_frame(invalid), schema).validate()
+
+
 def test_polars_external_features(as_frame):
     external = ln.Feature(name="pl_external", dtype=str).save()
     external_schema = ln.Schema(features=[external]).save()

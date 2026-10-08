@@ -2415,6 +2415,7 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
         features: dict[str, Any] | None = None,
         parquet_kwargs: dict[str, Any] | None = None,
         csv_kwargs: dict[str, Any] | None = None,
+        _parquet_sorting_columns: list[tuple[str, bool]] | None = None,
         **kwargs,
     ) -> Artifact:
         """Create from `DataFrame`, optionally validate & annotate.
@@ -2501,7 +2502,17 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
                     is_polars = True
                     kwargs.setdefault("format", path_suffix)
                 # otherwise the original file is registered as is
-        to_disk_kwargs: dict[str, Any] = parquet_kwargs or csv_kwargs
+        to_disk_kwargs: dict[str, Any] = dict(parquet_kwargs or csv_kwargs or {})
+        sorting_columns = _parquet_sorting_columns or (
+            schema.sorted_by
+            if isinstance(schema, Schema)
+            else []
+        )
+        is_csv = kwargs.get("format") == ".csv" or (
+            isinstance(key, str) and key.endswith(".csv")
+        )
+        if sorting_columns and not is_csv:
+            to_disk_kwargs["_lamindb_sorting_columns"] = sorting_columns
         artifact = Artifact(  # type: ignore
             path=df,
             key=key,

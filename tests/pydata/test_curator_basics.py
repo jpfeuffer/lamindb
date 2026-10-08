@@ -662,6 +662,62 @@ def test_pandera_dataframe_schema(
     ln.Feature.filter().delete(permanent=True)
 
 
+def test_pandera_column_rules_and_parquet_sorting_metadata():
+    import pyarrow.parquet as pq
+
+    schema = ln.Schema(
+        features=[
+            ln.Feature(
+                name="rule_id",
+                dtype=str,
+                unique=True,
+                regex=r"^ID-[0-9]+$",
+            ).save(),
+            ln.Feature(name="rule_group", dtype=str).save(),
+            ln.Feature(name="rule_rank", dtype=int).save(),
+        ],
+        unique=["rule_group", "rule_rank"],
+        sorted_by=["rule_group", ("rule_rank", False)],
+    ).save()
+    df = pd.DataFrame(
+        {
+            "rule_id": ["ID-1", "ID-2", "ID-3", "ID-4"],
+            "rule_group": ["a", "a", "b", "b"],
+            "rule_rank": [2, 1, 2, 1],
+        }
+    )
+    curator = ln.curators.DataFrameCurator(df, schema)
+    curator.validate()
+    artifact = curator.save_artifact(key="curation/rules-pandas.parquet")
+    metadata = pq.ParquetFile(artifact.path).metadata
+    assert list(metadata.row_group(0).sorting_columns) == [
+        pq.SortingColumn(1, descending=False, nulls_first=False),
+        pq.SortingColumn(2, descending=True, nulls_first=False),
+    ]
+
+    with pytest.raises(ValidationError):
+        ln.curators.DataFrameCurator(
+            df.assign(rule_id=["ID-1", "ID-1", "ID-3", "ID-4"]), schema
+        ).validate()
+    duplicate_combination = pd.DataFrame(
+        {
+            "rule_id": ["ID-5", "ID-6", "ID-7"],
+            "rule_group": ["a", "a", "a"],
+            "rule_rank": [2, 2, 1],
+        }
+    )
+    with pytest.raises(ValidationError):
+        ln.curators.DataFrameCurator(duplicate_combination, schema).validate()
+    with pytest.raises(ValidationError):
+        ln.curators.DataFrameCurator(
+            df.assign(rule_id=["invalid", "ID-2", "ID-3", "ID-4"]), schema
+        ).validate()
+    with pytest.raises(ValidationError):
+        ln.curators.DataFrameCurator(
+            df.assign(rule_rank=[1, 2, 2, 1]), schema
+        ).validate()
+
+
 def test_schema_not_saved(df):
     """Attempting to validate an unsaved Schema must error."""
     feature = ln.Feature(name="cell_type", dtype=str).save()

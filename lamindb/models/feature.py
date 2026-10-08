@@ -922,6 +922,8 @@ class Feature(SQLRecord, HasType, CanCurate, HasSynonyms, TracksRun, TracksUpdat
         default_value: `Any | None = None` Default value for the feature.
         coerce: `bool | None = None` When `True`, coerces this feature's values during validation.
             `Schema.coerce=True` also coerces it when this is left unset. See :attr:`~lamindb.Feature.coerce`.
+        unique: `bool = False` Whether non-null values in this feature must be unique in a dataframe.
+        regex: `str | None = None` A regular expression that every non-null string value must match.
         cat_filters: `dict[str, SQLRecord | bool | str] | None = None` For a categorical dtype, filter its related registry with these filters.
         values_through: `Feature | SQLRecordFieldName | None = None` Source of values
             for this feature. Pass a related :class:`~lamindb.Feature` to read and write
@@ -1304,6 +1306,8 @@ class Feature(SQLRecord, HasType, CanCurate, HasSynonyms, TracksRun, TracksUpdat
         nullable: bool | None = None,
         default_value: Any | None = None,
         coerce: bool | None = None,
+        unique: bool = False,
+        regex: str | None = None,
         cat_filters: dict[str, SQLRecord | bool | str] | None = None,
         values_through: Feature | SQLRecordFieldName | None = None,
         branch: Branch | None = None,
@@ -1335,6 +1339,8 @@ class Feature(SQLRecord, HasType, CanCurate, HasSynonyms, TracksRun, TracksUpdat
             return None
         default_value = kwargs.pop("default_value", None)
         nullable = kwargs.pop("nullable", None)
+        unique = kwargs.pop("unique", False)
+        regex = kwargs.pop("regex", None)
         # Default nullable to True for non-type features
         is_type = kwargs.get("is_type", False)
         if nullable is None and not is_type:
@@ -1355,6 +1361,8 @@ class Feature(SQLRecord, HasType, CanCurate, HasSynonyms, TracksRun, TracksUpdat
         self.default_value = default_value
         self.nullable = nullable
         self.coerce = coerce
+        self.unique = unique
+        self.regex = regex
         dtype_str = kwargs.pop("_dtype_str", None)
         if dtype_str == "cat":
             warnings.warn(
@@ -1712,6 +1720,40 @@ class Feature(SQLRecord, HasType, CanCurate, HasSynonyms, TracksRun, TracksUpdat
         else:
             self._clear_values_feature_pair()
             self._sqlrecord_field = None
+
+    @property
+    def unique(self) -> bool:
+        """Whether values in this feature must be unique within a dataframe."""
+        return bool(self._aux and self._aux.get("u", False))
+
+    @unique.setter
+    def unique(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TypeError("Feature.unique must be a bool")
+        if value:
+            self._aux = self._aux or {}
+            self._aux["u"] = True
+        elif self._aux is not None:
+            self._aux.pop("u", None)
+
+    @property
+    def regex(self) -> str | None:
+        """Regular expression matched against non-null string values."""
+        if self._aux is None:
+            return None
+        value = self._aux.get("rx")
+        return value if isinstance(value, str) else None
+
+    @regex.setter
+    def regex(self, value: str | None) -> None:
+        if value is not None and not isinstance(value, str):
+            raise TypeError("Feature.regex must be a string or None")
+        if value is None:
+            if self._aux is not None:
+                self._aux.pop("rx", None)
+        else:
+            self._aux = self._aux or {}
+            self._aux["rx"] = value
 
     @property
     def _values_feature_uid(self) -> str | None:

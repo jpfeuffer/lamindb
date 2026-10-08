@@ -141,6 +141,44 @@ def _coerce_lossless(series, expected_type: str):
     return coerced
 
 
+def _is_sorted(data: Any, sort_keys: list[tuple[str, bool]], is_polars: bool) -> bool:
+    columns = [name for name, _ in sort_keys]
+    ascending = [ascending for _, ascending in sort_keys]
+    if not is_polars:
+        if any(name not in data.columns for name in columns):
+            return False
+        return data.sort_values(
+            by=columns,
+            ascending=ascending,
+            kind="stable",
+            na_position="last",
+        ).equals(data)
+
+    import polars as pl
+
+    frame = data.lazyframe if hasattr(data, "lazyframe") else data
+    if isinstance(frame, pl.DataFrame):
+        frame = frame.lazy()
+    names = frame.collect_schema().names()
+    if any(name not in names for name in columns):
+        return False
+    row_index = "__lamindb_sort_row__"
+    while row_index in names:
+        row_index += "_"
+    return (
+        frame.with_row_index(row_index)
+        .sort(
+            by=columns,
+            descending=[not value for value in ascending],
+            nulls_last=True,
+            maintain_order=True,
+        )
+        .select(pl.col(row_index).is_sorted())
+        .collect()
+        .item()
+    )
+
+
 # Registered with no "int"/"float" equivalents, so pandera's fixed-width
 # dtypes stay unchanged. A real dtype is what pandera coerces; a Check cannot.
 @pandas_engine.Engine.register_dtype
@@ -683,12 +721,21 @@ class SlotsCurator(Curator):
             ]
             for type_check, af_constructor in type_mapping:
                 if type_check(self._dataset):
+                    artifact_kwargs = {}
+                    if self._schema.sorted_by and (
+                        isinstance(self._dataset, pd.DataFrame)
+                        or is_polars_dataframe(self._dataset)
+                    ):
+                        artifact_kwargs["_parquet_sorting_columns"] = (
+                            self._schema.sorted_by
+                        )
                     self._artifact = af_constructor(  # type: ignore
                         self._dataset,
                         key=key,
                         description=description,
                         revises=revises,
                         run=run,
+                        **artifact_kwargs,
                     )
                     break
         cat_vectors = {}
@@ -876,11 +923,21 @@ class ComponentCurator(Curator):
         self._pandera_schema: pandera.DataFrameSchema | PolarsDataFrameSchema | None = (
             None
         )
-        if features or schema._index_feature_uid is not None:
+        if (
+            features
+            or schema._index_feature_uid is not None
+            or schema.unique
+            or schema.sorted_by
+        ):
             # populate features
             if schema.minimal_set:
                 optional_feature_uids = set(schema.optionals.get_uids())
             for feature in features:
+                regex_checks = (
+                    [pandera.Check.str_matches(feature.regex)]
+                    if feature.regex is not None and not self._is_polars
+                    else []
+                )
                 if schema.minimal_set:
                     required = feature.uid not in optional_feature_uids
                 else:
@@ -895,16 +952,21 @@ class ComponentCurator(Curator):
                     dtype_str.startswith("list[cat")
                     or self._dataset.attrs.get(feature.name) == "list_of_categories"
                 ):
-                    pandera_columns[feature.name] = pandera.Column(
-                        dtype=None,
-                        checks=pandera.Check(
+                    checks = list(regex_checks)
+                    checks.append(
+                        pandera.Check(
                             check_dtype("list", feature.nullable),
                             element_wise=False,
                             error=f"Column '{feature.name}' failed dtype check for '{dtype_str}' against (list, nullable={feature.nullable})",
-                        ),
+                        )
+                    )
+                    pandera_columns[feature.name] = pandera.Column(
+                        dtype=None,
+                        checks=checks,
                         nullable=feature.nullable,
                         coerce=feature.coerce,
                         required=required,
+                        unique=feature.unique,
                     )
                 # AnyInt / AnyFloat: width-agnostic dtypes, same hook as DateTime
                 # so Feature.coerce and Schema.coerce both reach pandera.
@@ -914,6 +976,8 @@ class ComponentCurator(Curator):
                         nullable=feature.nullable,
                         coerce=feature.coerce,
                         required=required,
+                        unique=feature.unique,
+                        checks=regex_checks,
                     )
                 # "str" via check_dtype/check_pandera_str: keep pandas 2
                 # Column("str") results on pandas 3 (see check_pandera_str).
@@ -935,14 +999,18 @@ class ComponentCurator(Curator):
                         dtype = None
                     pandera_columns[feature.name] = pandera.Column(
                         dtype=None,
-                        checks=pandera.Check(
-                            check_dtype(dtype_str, feature.nullable),
-                            element_wise=False,
-                            error=f"Column '{feature.name}' failed dtype check for '{dtype_str}': got {dtype}",
-                        ),
+                        checks=[
+                            pandera.Check(
+                                check_dtype(dtype_str, feature.nullable),
+                                element_wise=False,
+                                error=f"Column '{feature.name}' failed dtype check for '{dtype_str}': got {dtype}",
+                            ),
+                            *regex_checks,
+                        ],
                         nullable=feature.nullable,
                         coerce=feature.coerce,
                         required=required,
+                        unique=feature.unique,
                     )
                 elif dtype_str == "dict":
                     pandera_columns[feature.name] = pandera.Column(
@@ -956,6 +1024,7 @@ class ComponentCurator(Curator):
                             .all(),
                             error="Non-null values must be dicts",
                         ),
+                        unique=feature.unique,
                     )
                 else:
                     if dtype_str == "datetime64[ns, UTC]":
@@ -974,6 +1043,8 @@ class ComponentCurator(Curator):
                         nullable=feature.nullable,
                         coerce=feature.coerce,
                         required=required,
+                        unique=feature.unique,
+                        checks=regex_checks,
                     )
                 if dtype_str.startswith("cat") or dtype_str.startswith("list[cat["):
                     # validate categoricals if the column is required or if the column is present
@@ -1018,6 +1089,16 @@ class ComponentCurator(Curator):
                     regex=True, required=False, nullable=True
                 )
             if self._is_polars:
+                checks = (
+                    [
+                        polars_pandera.Check(
+                            lambda data: _is_sorted(data, schema.sorted_by, True),
+                            ignore_na=False,
+                        )
+                    ]
+                    if schema.sorted_by
+                    else []
+                )
                 self._pandera_schema = polars_pandera.DataFrameSchema(
                     pandera_columns,
                     # Polars cannot coerce dtype=None columns. The schema flag
@@ -1025,14 +1106,28 @@ class ComponentCurator(Curator):
                     coerce=False,
                     strict=schema.maximal_set,
                     ordered=schema.ordered_set,
+                    unique=schema.unique or None,
+                    checks=checks,
                 )
             else:
+                checks = (
+                    [
+                        pandera.Check(
+                            lambda data: _is_sorted(data, schema.sorted_by, False),
+                            ignore_na=False,
+                        )
+                    ]
+                    if schema.sorted_by
+                    else []
+                )
                 self._pandera_schema = pandera.DataFrameSchema(
                     pandera_columns,
                     index=index,
                     coerce=schema.coerce,
                     strict=schema.maximal_set,
                     ordered=schema.ordered_set,
+                    unique=schema.unique or None,
+                    checks=checks,
                 )
         if (
             schema.itype == "Composite"

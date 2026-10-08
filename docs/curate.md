@@ -169,6 +169,32 @@ except ln.errors.ValidationError as error:
     print(error)
 ```
 
+### Column and row-order constraints
+
+Dataframe schemas can also enforce uniqueness, regular-expression matches, and
+row ordering. Set `unique=True` on a feature for per-column uniqueness and
+`regex` for a string pattern; use `Schema.unique` for a unique combination of
+columns. `Schema.sorted_by` checks the existing lexicographic row order—it does
+not sort the data. Column names mean ascending order, while
+`(column_name, False)` selects descending order:
+
+```python
+schema = ln.Schema(
+    features=[
+        ln.Feature(name="sample_id", dtype=str, unique=True, regex=r"^S-[0-9]+$"),
+        ln.Feature(name="study", dtype=str),
+        ln.Feature(name="timepoint", dtype=int),
+    ],
+    unique=["study", "timepoint"],
+    sorted_by=["study", ("timepoint", False)],
+)
+```
+
+These constraints validate pandas DataFrames, Polars DataFrames, and Polars
+LazyFrames. A validated schema with `sorted_by` also writes Parquet row-group
+`sorting_columns` metadata when saving a dataframe artifact with PyArrow
+available; it describes the validated order but does not perform sorting.
+
 ### (4) Fix validation errors
 
 Check the non-validated terms:
