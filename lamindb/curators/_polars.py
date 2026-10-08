@@ -118,6 +118,10 @@ def column(feature, required: bool, schema_coerce: bool = False):
     checks = (
         [pandera.Check.str_matches(feature.regex)] if feature.regex is not None else []
     )
+    if feature.min_value is not None:
+        checks.append(pandera.Check.ge(feature.min_value))
+    if feature.max_value is not None:
+        checks.append(pandera.Check.le(feature.max_value))
     if dtype_str in {"int", "float"}:
         return pandera.Column(f"lamindb.{dtype_str}", checks=checks, **kwargs)
     if (

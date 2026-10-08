@@ -172,10 +172,11 @@ except ln.errors.ValidationError as error:
 ### Column and row-order constraints
 
 Dataframe schemas can also enforce uniqueness, regular-expression matches, and
-row ordering. Set `unique=True` on a feature for per-column uniqueness and
-`regex` for a string pattern; use `Schema.unique` for a unique combination of
-columns. `Schema.sorted_by` checks the existing lexicographic row order—it does
-not sort the data. Column names mean ascending order, while
+row ordering. Set `unique=True` on a feature for per-column uniqueness,
+`regex` for a string pattern, and `min_value`/`max_value` for inclusive numeric
+bounds. Use `Schema.unique` for a unique combination of columns.
+`Schema.sorted_by` checks the existing lexicographic row order—it does not sort
+the data. Column names mean ascending order, while
 `(column_name, False)` selects descending order:
 
 ```python
@@ -183,7 +184,7 @@ schema = ln.Schema(
     features=[
         ln.Feature(name="sample_id", dtype=str, unique=True, regex=r"^S-[0-9]+$"),
         ln.Feature(name="study", dtype=str),
-        ln.Feature(name="timepoint", dtype=int),
+        ln.Feature(name="timepoint", dtype=int, min_value=0, max_value=24),
     ],
     unique=["study", "timepoint"],
     sorted_by=["study", ("timepoint", False)],

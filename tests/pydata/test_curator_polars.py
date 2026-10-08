@@ -421,6 +421,35 @@ def test_polars_column_rules_and_parquet_sorting_metadata(as_frame):
             ln.curators.DataFrameCurator(as_frame(invalid), schema).validate()
 
 
+@pytest.mark.parametrize(
+    "dtype,values,lower,upper",
+    [
+        (int, [0, 5, 10], 0, 10),
+        (float, [0.0, 5.5, 10.0], 0.0, 10.0),
+        ("num", [0, 5.5, 10], 0, 10),
+    ],
+)
+def test_polars_numeric_feature_bounds(as_frame, dtype, values, lower, upper):
+    schema = make_schema(
+        [
+            (
+                "pl_bounded_numeric",
+                dtype,
+                {"min_value": lower, "max_value": upper},
+            )
+        ]
+    )
+    ln.curators.DataFrameCurator(
+        as_frame(pl.DataFrame({"pl_bounded_numeric": values})), schema
+    ).validate()
+    for invalid_values in ([lower - 1, upper], [lower, upper + 1]):
+        with pytest.raises(ValidationError):
+            ln.curators.DataFrameCurator(
+                as_frame(pl.DataFrame({"pl_bounded_numeric": invalid_values})),
+                schema,
+            ).validate()
+
+
 def test_polars_external_features(as_frame):
     external = ln.Feature(name="pl_external", dtype=str).save()
     external_schema = ln.Schema(features=[external]).save()

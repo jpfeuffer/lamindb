@@ -1149,13 +1149,21 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
                 token = feature.uid
                 if feature in optional_feature_set:
                     token += f"({HASH_CODE['optional']})"
-                if feature.unique or feature.regex is not None:
+                if (
+                    feature.unique
+                    or feature.regex is not None
+                    or feature.min_value is not None
+                    or feature.max_value is not None
+                ):
                     regex_hash = (
                         hash_string(feature.regex)
                         if feature.regex is not None
                         else None
                     )
-                    token += f"(u={feature.unique},r={regex_hash})"
+                    token += (
+                        f"(u={feature.unique},r={regex_hash},"
+                        f"min={feature.min_value},max={feature.max_value})"
+                    )
                 feature_list_for_hashing.append(token)
             if not ordered_set:  # order matters if ordered_set is True, if not sort
                 feature_list_for_hashing = sorted(feature_list_for_hashing)

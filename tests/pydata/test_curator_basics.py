@@ -718,6 +718,44 @@ def test_pandera_column_rules_and_parquet_sorting_metadata():
         ).validate()
 
 
+@pytest.mark.parametrize(
+    "dtype,values,lower,upper",
+    [
+        (int, [0, 5, 10], 0, 10),
+        (float, [0.0, 5.5, 10.0], 0.0, 10.0),
+        ("num", [0, 5.5, 10], 0, 10),
+    ],
+)
+def test_pandera_numeric_feature_bounds(dtype, values, lower, upper):
+    feature = ln.Feature(
+        name="bounded_numeric",
+        dtype=dtype,
+        min_value=lower,
+        max_value=upper,
+    ).save()
+    schema = ln.Schema(features=[feature]).save()
+    assert feature.min_value == lower
+    assert feature.max_value == upper
+    ln.curators.DataFrameCurator(
+        pd.DataFrame({"bounded_numeric": values}), schema
+    ).validate()
+
+    for invalid_values in ([lower - 1, upper], [lower, upper + 1]):
+        with pytest.raises(ValidationError):
+            ln.curators.DataFrameCurator(
+                pd.DataFrame({"bounded_numeric": invalid_values}), schema
+            ).validate()
+
+
+def test_numeric_feature_bounds_validate_configuration():
+    with pytest.raises(ln.errors.InvalidArgument, match="only valid"):
+        ln.Feature(name="bounded_text", dtype=str, min_value=0)
+    with pytest.raises(ln.errors.InvalidArgument, match="cannot be greater"):
+        ln.Feature(name="inverted_bounds", dtype=int, min_value=10, max_value=0)
+    with pytest.raises(TypeError, match="finite number"):
+        ln.Feature(name="boolean_bound", dtype=int, min_value=True)
+
+
 def test_schema_not_saved(df):
     """Attempting to validate an unsaved Schema must error."""
     feature = ln.Feature(name="cell_type", dtype=str).save()

@@ -933,11 +933,15 @@ class ComponentCurator(Curator):
             if schema.minimal_set:
                 optional_feature_uids = set(schema.optionals.get_uids())
             for feature in features:
-                regex_checks = (
+                feature_checks = (
                     [pandera.Check.str_matches(feature.regex)]
                     if feature.regex is not None and not self._is_polars
                     else []
                 )
+                if feature.min_value is not None:
+                    feature_checks.append(pandera.Check.ge(feature.min_value))
+                if feature.max_value is not None:
+                    feature_checks.append(pandera.Check.le(feature.max_value))
                 if schema.minimal_set:
                     required = feature.uid not in optional_feature_uids
                 else:
@@ -952,7 +956,7 @@ class ComponentCurator(Curator):
                     dtype_str.startswith("list[cat")
                     or self._dataset.attrs.get(feature.name) == "list_of_categories"
                 ):
-                    checks = list(regex_checks)
+                    checks = list(feature_checks)
                     checks.append(
                         pandera.Check(
                             check_dtype("list", feature.nullable),
@@ -977,7 +981,7 @@ class ComponentCurator(Curator):
                         coerce=feature.coerce,
                         required=required,
                         unique=feature.unique,
-                        checks=regex_checks,
+                        checks=feature_checks,
                     )
                 # "str" via check_dtype/check_pandera_str: keep pandas 2
                 # Column("str") results on pandas 3 (see check_pandera_str).
@@ -1005,7 +1009,7 @@ class ComponentCurator(Curator):
                                 element_wise=False,
                                 error=f"Column '{feature.name}' failed dtype check for '{dtype_str}': got {dtype}",
                             ),
-                            *regex_checks,
+                            *feature_checks,
                         ],
                         nullable=feature.nullable,
                         coerce=feature.coerce,
@@ -1044,7 +1048,7 @@ class ComponentCurator(Curator):
                         coerce=feature.coerce,
                         required=required,
                         unique=feature.unique,
-                        checks=regex_checks,
+                        checks=feature_checks,
                     )
                 if dtype_str.startswith("cat") or dtype_str.startswith("list[cat["):
                     # validate categoricals if the column is required or if the column is present
