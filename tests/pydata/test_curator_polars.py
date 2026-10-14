@@ -5,6 +5,7 @@ import lamindb as ln
 import pytest
 from django.db import transaction
 from lamindb.errors import InvalidArgument, ValidationError
+from upath import UPath
 
 pl = pytest.importorskip("polars")
 pa = pytest.importorskip("pandera.polars")
@@ -45,6 +46,8 @@ def test_polars_scalar_and_nested_dtypes(as_frame):
             ("pl_bool", bool, {}),
             ("pl_num", "num", {}),
             ("pl_list", list[str], {}),
+            ("pl_list_int", list[int], {}),
+            ("pl_list_float", list[float], {}),
             ("pl_dict", dict, {}),
             ("pl_date", date, {}),
             ("pl_datetime", datetime, {}),
@@ -60,6 +63,8 @@ def test_polars_scalar_and_nested_dtypes(as_frame):
             "pl_bool": [True, False],
             "pl_num": [1, 2],
             "pl_list": [["a"], ["b"]],
+            "pl_list_int": pl.Series([[1], [2]], dtype=pl.List(pl.Int16)),
+            "pl_list_float": pl.Series([[1.0], [2.0]], dtype=pl.List(pl.Float32)),
             "pl_dict": [{"a": 1}, {"a": 2}],
             "pl_date": [date(2024, 1, 1)] * 2,
             "pl_datetime": [datetime(2024, 1, 1)] * 2,
@@ -73,6 +78,8 @@ def test_polars_scalar_and_nested_dtypes(as_frame):
     assert eager(curator.dataset).equals(df)
     assert curator.dataset.collect_schema()["pl_int"] == pl.Int16
     assert curator.dataset.collect_schema()["pl_float"] == pl.Float32
+    assert curator.dataset.collect_schema()["pl_list_int"] == pl.List(pl.Int16)
+    assert curator.dataset.collect_schema()["pl_list_float"] == pl.List(pl.Float32)
 
 
 @pytest.mark.parametrize(
@@ -83,7 +90,10 @@ def test_polars_scalar_and_nested_dtypes(as_frame):
         (str, [1]),
         (bool, [1]),
         (list[str], [[1]]),
+        (list[int], [["a"]]),
+        (list[float], [["a"]]),
         (dict, ["a"]),
+        ("list[object]", [["a"]]),
     ],
 )
 def test_polars_invalid_dtype(as_frame, dtype, values):
@@ -97,18 +107,28 @@ def test_polars_invalid_dtype(as_frame, dtype, values):
 
 
 @pytest.mark.parametrize("coerce_on", ["feature", "schema"])
-@pytest.mark.parametrize("dtype,expected", [(int, pl.Int64), (float, pl.Float64)])
-def test_polars_coercion(as_frame, coerce_on, dtype, expected):
+@pytest.mark.parametrize(
+    "dtype,values,expected_dtype,expected_values",
+    [
+        (int, ["1", "2"], pl.Int64, [1, 2]),
+        (float, ["1", "2"], pl.Float64, [1.0, 2.0]),
+        (float, pl.Series([1.0, 2.0], dtype=pl.Float32), pl.Float32, [1.0, 2.0]),
+    ],
+    ids=["int-from-str", "float-from-str", "float32-preserved"],
+)
+def test_polars_coercion(
+    as_frame, coerce_on, dtype, values, expected_dtype, expected_values
+):
     schema = make_schema(
         [("pl_coerce", dtype, {"coerce": coerce_on == "feature"})],
         coerce=coerce_on == "schema",
     )
-    df = pl.DataFrame({"pl_coerce": ["1", "2"]})
+    df = pl.DataFrame({"pl_coerce": values})
     curator = ln.curators.DataFrameCurator(as_frame(df), schema)
     curator.validate()
     assert type(curator.dataset) is type(as_frame(df))
-    assert curator.dataset.collect_schema()["pl_coerce"] == expected
-    assert eager(curator.dataset)["pl_coerce"].to_list() == [1, 2]
+    assert curator.dataset.collect_schema()["pl_coerce"] == expected_dtype
+    assert eager(curator.dataset)["pl_coerce"].to_list() == expected_values
 
 
 def test_polars_coercion_is_lossless(as_frame):
@@ -207,6 +227,12 @@ def test_polars_standardize(as_frame):
     assert eager(curator.dataset)["pl_missing"].to_list() == [None, None]
     curator.validate()
 
+    required = make_schema([("pl_required_missing", int, {"nullable": False})])
+    with pytest.raises(ValidationError, match="pl_required_missing"):
+        ln.curators.DataFrameCurator(
+            as_frame(pl.DataFrame({"other": [1]})), required
+        ).standardize()
+
 
 def test_polars_index_not_supported(as_frame):
     index = ln.Feature(name="pl_index", dtype=str).save()
@@ -289,6 +315,39 @@ def test_polars_invalid_coercion(as_frame, dtype):
         ln.curators.DataFrameCurator(
             as_frame(pl.DataFrame({"pl_bad_cast": ["not a number"]})), schema
         ).validate()
+
+
+def test_polars_standardize_column_synonym(as_frame):
+    feature = ln.Feature(name="pl_canonical_col", dtype=int).save()
+    feature.add_synonym("pl_alias_col")
+    schema = ln.Schema(itype=ln.Feature).save()
+    curator = ln.curators.DataFrameCurator(
+        as_frame(pl.DataFrame({"pl_alias_col": [1]})), schema
+    )
+    curator.cat.standardize("columns")
+    assert list(curator.dataset.collect_schema().names()) == ["pl_canonical_col"]
+
+
+def test_polars_biorecord_source_filter():
+    from lamindb.curators.core import DataFrameCatManager
+
+    source = bt.Source(
+        entity="bionty.CellType", organism="all", name="polars-cl", version="1"
+    ).save()
+    schema = make_schema([("pl_cell_source", bt.CellType, {})])
+    manager = DataFrameCatManager(
+        pl.DataFrame({"pl_cell_source": ["T cell"]}),
+        categoricals=list(schema.members),
+        sources={"pl_cell_source": source},
+        schema=schema,
+    )
+    assert manager._cat_vectors["pl_cell_source"]._filter_kwargs["source"] == source
+
+
+def test_polars_unique_values_without_registry_columns():
+    schema = make_schema([("pl_no_cat", int, {})])
+    curator = ln.curators.DataFrameCurator(pl.DataFrame({"pl_no_cat": [1]}), schema)
+    assert curator.cat._get_unique_values() == {}
 
 
 @pytest.mark.parametrize("list_values", [False, True])
@@ -483,12 +542,15 @@ def test_polars_standardize_empty_frame_preserves_rows(as_frame):
     curator.validate()
 
 
-@pytest.mark.parametrize("suffix", [".parquet", ".csv"])
+@pytest.mark.parametrize("suffix", [".parquet", ".csv", ".tsv"])
 def test_from_dataframe_path_validates_lazily(monkeypatch, tmp_path, suffix):
     schema = make_schema([("pl_file", int, {})])
     path = tmp_path / f"file{suffix}"
     frame = pl.DataFrame({"pl_file": [1, 2, 3]})
-    frame.write_parquet(path) if suffix == ".parquet" else frame.write_csv(path)
+    if suffix == ".parquet":
+        frame.write_parquet(path)
+    else:
+        frame.write_csv(path, separator="\t" if suffix == ".tsv" else ",")
 
     def unexpected_load(*args, **kwargs):
         pytest.fail("The file must be scanned lazily, not loaded")
@@ -506,7 +568,10 @@ def test_from_dataframe_path_validates_lazily(monkeypatch, tmp_path, suffix):
 
     bad = tmp_path / f"bad{suffix}"
     bad_frame = pl.DataFrame({"pl_file": ["x"]})
-    bad_frame.write_parquet(bad) if suffix == ".parquet" else bad_frame.write_csv(bad)
+    if suffix == ".parquet":
+        bad_frame.write_parquet(bad)
+    else:
+        bad_frame.write_csv(bad, separator="\t" if suffix == ".tsv" else ",")
     with pytest.raises(ValidationError):
         ln.Artifact.from_dataframe(str(bad), key=f"polars/bad{suffix}", schema=schema)
 
@@ -564,14 +629,27 @@ def test_from_dataframe_path_stores_coerced_values(tmp_path, suffix):
 def test_scan_dataframe_file_falls_back_on_failure(tmp_path):
     from lamindb.models.artifact import _scan_dataframe_file
 
-    assert _scan_dataframe_file(str(tmp_path / "missing.parquet")) is None
+    assert _scan_dataframe_file(UPath(tmp_path / "missing.parquet")) is None
 
 
-def test_remote_paths_are_scannable():
+def test_remote_paths_are_scannable(monkeypatch):
     from lamindb.models.artifact import _can_scan_lazily
 
     schema = make_schema([("pl_remote", int, {})])
     assert _can_scan_lazily("s3://bucket/data.parquet", schema)
     assert _can_scan_lazily("gs://bucket/data.csv", schema)
+    assert _can_scan_lazily("s3://bucket/data.tsv", schema)
     assert not _can_scan_lazily("s3://bucket/data.h5ad", schema)
     assert not _can_scan_lazily("ftp://host/data.parquet", schema)
+
+    coercing = make_schema([("pl_remote_coerce", int, {"coerce": True})])
+    assert not _can_scan_lazily("s3://bucket/data.tsv", coercing)
+
+    index = ln.Feature(name="pl_scan_index", dtype=str).save()
+    indexed = ln.Schema(itype=ln.Feature, index=index).save()
+    assert not _can_scan_lazily("s3://bucket/data.parquet", indexed)
+
+    monkeypatch.setattr(
+        "lamindb.models.artifact.is_package_installed", lambda _name: False
+    )
+    assert not _can_scan_lazily("s3://bucket/data.parquet", schema)
