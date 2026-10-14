@@ -89,6 +89,8 @@ def _matches_dtype(dtype, expected: str) -> bool:
         return isinstance(dtype, pl.List) and _matches_dtype(
             dtype.inner, expected[5:-1]
         )
+    if expected == "list":
+        return isinstance(dtype, pl.List)
     if expected in {"str", "path", "url"} or expected.startswith("cat"):
         return dtype == pl.String or isinstance(dtype, (pl.Categorical, pl.Enum))
     if expected == "int":
@@ -111,9 +113,17 @@ def column(feature, required: bool, schema_coerce: bool = False):
         "nullable": feature.nullable,
         "coerce": feature.coerce or schema_coerce,
         "required": required,
+        "unique": feature.unique,
     }
+    checks = (
+        [pandera.Check.str_matches(feature.regex)] if feature.regex is not None else []
+    )
+    if feature.min_value is not None:
+        checks.append(pandera.Check.ge(feature.min_value))
+    if feature.max_value is not None:
+        checks.append(pandera.Check.le(feature.max_value))
     if dtype_str in {"int", "float"}:
-        return pandera.Column(f"lamindb.{dtype_str}", **kwargs)
+        return pandera.Column(f"lamindb.{dtype_str}", checks=checks, **kwargs)
     if (
         dtype_str in {"bool", "num", "str", "path", "url", "dict"}
         or dtype_str.startswith("list")
@@ -146,12 +156,15 @@ def column(feature, required: bool, schema_coerce: bool = False):
                 feature.nullable and _all_missing(data)
             )
 
-        return pandera.Column(
-            dtype=None,
-            checks=pandera.Check(
+        checks.append(
+            pandera.Check(
                 check,
                 error=f"Column '{feature.name}' failed dtype check for '{dtype_str}'",
-            ),
+            )
+        )
+        return pandera.Column(
+            dtype=None,
+            checks=checks,
             **kwargs,
         )
     dtype = (
@@ -163,4 +176,4 @@ def column(feature, required: bool, schema_coerce: bool = False):
         if dtype_str == "date"
         else dtype_str
     )
-    return pandera.Column(dtype, **kwargs)
+    return pandera.Column(dtype, checks=checks, **kwargs)

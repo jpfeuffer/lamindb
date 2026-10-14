@@ -2392,6 +2392,7 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
         features: dict[str, Any] | None = None,
         parquet_kwargs: dict[str, Any] | None = None,
         csv_kwargs: dict[str, Any] | None = None,
+        _parquet_sorting_columns: list[tuple[str, bool]] | None = None,
         **kwargs,
     ) -> Artifact:
         """Create from `DataFrame`, optionally validate & annotate.
@@ -2466,15 +2467,12 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
             coerced = DataFrameCurator(df, schema, features=features)
             coerced.validate()
             df = coerced.dataset
-        # df is a local or remote .parquet, .csv, or .tsv path
         elif schema is not None and _can_scan_lazily(df, schema):
             from lamindb.curators.core import DataFrameCurator
 
-            df = create_path(df)
-
             lazy = _scan_dataframe_file(df)
             if lazy is not None:
-                path_suffix = df.suffix
+                path_suffix = "." + str(df).rsplit(".", 1)[-1]
                 polars_curator = DataFrameCurator(lazy, schema, features=features)
                 polars_curator.validate()
                 if _schema_coerces(schema):
@@ -2483,7 +2481,15 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
                     is_polars = True
                     kwargs.setdefault("format", path_suffix)
                 # a non-coercing schema keeps the original file
-        to_disk_kwargs: dict[str, Any] = parquet_kwargs or csv_kwargs
+        to_disk_kwargs: dict[str, Any] = dict(parquet_kwargs or csv_kwargs or {})
+        sorting_columns = _parquet_sorting_columns or (
+            schema.sorted_by if isinstance(schema, Schema) else []
+        )
+        is_csv = kwargs.get("format") == ".csv" or (
+            isinstance(key, str) and key.endswith(".csv")
+        )
+        if sorting_columns and not is_csv:
+            to_disk_kwargs["_lamindb_sorting_columns"] = sorting_columns
         artifact = Artifact(  # type: ignore
             path=df,
             key=key,
