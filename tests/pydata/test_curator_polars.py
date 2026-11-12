@@ -462,7 +462,8 @@ def test_polars_column_rules_and_parquet_sorting_metadata(as_frame):
     curator.validate()
     assert isinstance(curator.dataset, type(as_frame(df)))
     artifact = curator.save_artifact(
-        key=f"polars/rules-{type(curator.dataset).__name__}.parquet"
+        key=f"polars/rules-{type(curator.dataset).__name__}.parquet",
+        write_parquet_sorting_metadata=True,
     )
     metadata = pq.ParquetFile(artifact.path).metadata
     assert list(metadata.row_group(0).sorting_columns) == [
@@ -478,6 +479,79 @@ def test_polars_column_rules_and_parquet_sorting_metadata(as_frame):
     for invalid in invalid_frames:
         with pytest.raises(ValidationError):
             ln.curators.DataFrameCurator(as_frame(invalid), schema).validate()
+
+
+def test_lazyframe_default_sorted_save_uses_native_sink(monkeypatch):
+    import pyarrow.parquet as pq
+
+    schema = make_schema([("lazy_sort_value", int, {})], sorted_by=["lazy_sort_value"])
+    curator = ln.curators.DataFrameCurator(
+        pl.DataFrame({"lazy_sort_value": [1, 2, 3]}).lazy(), schema
+    )
+    calls = []
+    sink = pl.LazyFrame.sink_parquet
+
+    def record_sink(self, path, **kwargs):
+        calls.append(path)
+        return sink(self, path, **kwargs)
+
+    def no_rewrite(*args, **kwargs):
+        raise AssertionError("Default save must not rewrite the Parquet file")
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", record_sink)
+    monkeypatch.setattr(pq, "ParquetWriter", no_rewrite)
+    artifact = curator.save_artifact(key="polars/native-sorted.parquet")
+    assert len(calls) == 1
+    assert not pq.ParquetFile(artifact.path).metadata.row_group(0).sorting_columns
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_polars_sort_metadata_nulls_last(as_frame, descending):
+    import pyarrow.parquet as pq
+
+    schema = make_schema(
+        [("pl_nullable_sort", int, {"nullable": True})],
+        sorted_by=[("pl_nullable_sort", not descending)],
+    )
+    values = [2, 1, None] if descending else [1, 2, None]
+    curator = ln.curators.DataFrameCurator(
+        as_frame(pl.DataFrame({"pl_nullable_sort": values})), schema
+    )
+    artifact = curator.save_artifact(
+        key=f"polars/null-sort-{descending}-{type(curator.dataset).__name__}.parquet",
+        write_parquet_sorting_metadata=True,
+    )
+    metadata = pq.ParquetFile(artifact.path).metadata
+    assert list(metadata.row_group(0).sorting_columns) == [
+        pq.SortingColumn(0, descending=descending, nulls_first=False)
+    ]
+    with pytest.raises(ValidationError):
+        ln.curators.DataFrameCurator(
+            as_frame(pl.DataFrame({"pl_nullable_sort": [None, 1, 2]})), schema
+        ).validate()
+
+
+def test_lazyframe_metadata_opt_in_multiple_row_groups():
+    import pyarrow.parquet as pq
+
+    schema = make_schema(
+        [("lazy_row_group_sort", int, {"nullable": True})],
+        sorted_by=["lazy_row_group_sort"],
+    )
+    df = pl.DataFrame({"lazy_row_group_sort": [1, 2, 3, None]}).lazy()
+    artifact = ln.Artifact.from_dataframe(
+        df,
+        key="polars/multiple-sort-row-groups.parquet",
+        schema=schema,
+        parquet_kwargs={"row_group_size": 2},
+        write_parquet_sorting_metadata=True,
+    ).save()
+    metadata = pq.ParquetFile(artifact.path).metadata
+    assert metadata.num_row_groups == 2
+    for i in range(metadata.num_row_groups):
+        assert list(metadata.row_group(i).sorting_columns) == [
+            pq.SortingColumn(0, descending=False, nulls_first=False)
+        ]
 
 
 @pytest.mark.parametrize(

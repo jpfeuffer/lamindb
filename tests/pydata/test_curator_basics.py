@@ -688,7 +688,9 @@ def test_pandera_column_rules_and_parquet_sorting_metadata():
     )
     curator = ln.curators.DataFrameCurator(df, schema)
     curator.validate()
-    artifact = curator.save_artifact(key="curation/rules-pandas.parquet")
+    artifact = curator.save_artifact(
+        key="curation/rules-pandas.parquet", write_parquet_sorting_metadata=True
+    )
     metadata = pq.ParquetFile(artifact.path).metadata
     assert list(metadata.row_group(0).sorting_columns) == [
         pq.SortingColumn(1, descending=False, nulls_first=False),
