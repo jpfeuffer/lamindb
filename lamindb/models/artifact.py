@@ -2550,6 +2550,7 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
         features: dict[str, Any] | None = None,
         parquet_kwargs: dict[str, Any] | None = None,
         csv_kwargs: dict[str, Any] | None = None,
+        write_parquet_sorting_metadata: bool = False,
         _parquet_sorting_columns: list[tuple[str, bool]] | None = None,
         **kwargs,
     ) -> Artifact:
@@ -2571,6 +2572,8 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
                 `pandas.DataFrame.to_parquet` method, which are passed
                 on to `pyarrow.parquet.ParquetWriter`.
             csv_kwargs: Additional keyword arguments passed to the `pandas.DataFrame.to_csv` method.
+            write_parquet_sorting_metadata: Write verified `schema.sorted_by` as
+                Parquet row-group metadata (requires a dataframe and a sorted schema).
 
         Examples:
 
@@ -2597,6 +2600,19 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
                :language: python
         """
         is_polars = is_polars_dataframe(df)
+        if write_parquet_sorting_metadata:
+            if (
+                not isinstance(schema, Schema)
+                or not schema.sorted_by
+                or not (is_polars or data_is_dataframe(df))
+                or kwargs.get("format") == ".csv"
+                or (key is not None and key.endswith(".csv"))
+            ):
+                raise InvalidArgument(
+                    "Parquet sorting metadata requires a dataframe, a Parquet "
+                    "artifact, and a schema with sorted_by."
+                )
+            _parquet_sorting_columns = schema.sorted_by
         if "format" not in kwargs and key is not None and key.endswith(".csv"):
             kwargs["format"] = ".csv"
         if schema == "valid_features":
@@ -2639,9 +2655,7 @@ class Artifact(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
                     kwargs.setdefault("format", path_suffix)
                 # a non-coercing schema keeps the original file
         to_disk_kwargs: dict[str, Any] = dict(parquet_kwargs or csv_kwargs or {})
-        sorting_columns = _parquet_sorting_columns or (
-            schema.sorted_by if isinstance(schema, Schema) else []
-        )
+        sorting_columns = _parquet_sorting_columns
         is_csv = kwargs.get("format") == ".csv" or (
             isinstance(key, str) and key.endswith(".csv")
         )

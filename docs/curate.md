@@ -225,9 +225,13 @@ schema = ln.Schema(
 ```
 
 These constraints validate pandas DataFrames, Polars DataFrames, and Polars
-LazyFrames. A validated schema with `sorted_by` also writes Parquet row-group
-`sorting_columns` metadata when saving a dataframe artifact with PyArrow
-available; it describes the validated order but does not perform sorting.
+LazyFrames. Sorting metadata is optional: pass
+`write_parquet_sorting_metadata=True` to `curator.save_artifact()` or
+`Artifact.from_dataframe()` with a schema containing `sorted_by` to write
+Parquet row-group `sorting_columns` metadata using PyArrow. The order is
+checked again before metadata is written; nulls must be last for each sort key.
+This does not sort the data. By default, no sorting metadata is written and
+Polars LazyFrames use the native single-pass Parquet sink.
 
 ### (4) Fix validation errors
 

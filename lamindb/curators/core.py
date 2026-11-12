@@ -142,7 +142,13 @@ def _coerce_lossless(series, expected_type: str):
     return coerced
 
 
-def _is_sorted(data: Any, sort_keys: list[tuple[str, bool]], is_polars: bool) -> bool:
+def _is_sorted(
+    data: Any,
+    sort_keys: list[tuple[str, bool]],
+    is_polars: bool,
+    *,
+    nulls_last: bool = True,
+) -> bool:
     columns = [name for name, _ in sort_keys]
     ascending = [ascending for _, ascending in sort_keys]
     if not is_polars:
@@ -152,7 +158,7 @@ def _is_sorted(data: Any, sort_keys: list[tuple[str, bool]], is_polars: bool) ->
             by=columns,
             ascending=ascending,
             kind="stable",
-            na_position="last",
+            na_position="last" if nulls_last else "first",
         ).equals(data)
 
     import polars as pl
@@ -171,7 +177,7 @@ def _is_sorted(data: Any, sort_keys: list[tuple[str, bool]], is_polars: bool) ->
         .sort(
             by=columns,
             descending=[not value for value in ascending],
-            nulls_last=True,
+            nulls_last=nulls_last,
             maintain_order=True,
         )
         .select(pl.col(row_index).is_sorted())
@@ -694,6 +700,7 @@ class SlotsCurator(Curator):
         description: str | None = None,
         revises: Artifact | None = None,
         run: Run | None = None,
+        _parquet_sorting_columns: list[tuple[str, bool]] | None = None,
     ) -> Artifact:
         """{}"""  # noqa: D415
         if not self._is_validated:
@@ -727,12 +734,12 @@ class SlotsCurator(Curator):
             for type_check, af_constructor in type_mapping:
                 if type_check(self._dataset):
                     artifact_kwargs = {}
-                    if self._schema.sorted_by and (
+                    if _parquet_sorting_columns and (
                         isinstance(self._dataset, pd.DataFrame)
                         or is_polars_dataframe(self._dataset)
                     ):
                         artifact_kwargs["_parquet_sorting_columns"] = (
-                            self._schema.sorted_by
+                            _parquet_sorting_columns
                         )
                     self._artifact = af_constructor(  # type: ignore
                         self._dataset,
@@ -1547,16 +1554,42 @@ class DataFrameCurator(SlotsCurator):
 
     @doc_args(SAVE_ARTIFACT_DOCSTRING)
     def save_artifact(
-        self, *, key=None, description=None, revises=None, run=None
+        self,
+        *,
+        key=None,
+        description=None,
+        revises=None,
+        run=None,
+        write_parquet_sorting_metadata: bool = False,
     ) -> Artifact:
-        """{}."""
+        """{}.
+
+        Args:
+            write_parquet_sorting_metadata: Write verified `schema.sorted_by` as
+                Parquet row-group metadata. Defaults to `False`.
+        """
+        if write_parquet_sorting_metadata and (
+            not self._schema.sorted_by
+            or self._artifact is not None
+            or (key is not None and key.endswith(".csv"))
+        ):
+            raise InvalidArgument(
+                "Parquet sorting metadata requires a new Parquet artifact and "
+                "a schema with sorted_by."
+            )
         if not self._is_validated or not self._atomic_curator._is_validated:
             self.validate()
         self._dataset = self.dataset
         self._slots["columns"] = self._atomic_curator
         try:
             return super().save_artifact(
-                key=key, description=description, revises=revises, run=run
+                key=key,
+                description=description,
+                revises=revises,
+                run=run,
+                _parquet_sorting_columns=(
+                    self._schema.sorted_by if write_parquet_sorting_metadata else None
+                ),
             )
         finally:
             del self._slots["columns"]
