@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from django.db import models
@@ -16,7 +17,7 @@ from lamindb.base.fields import (
 from lamindb.base.utils import strict_classmethod
 
 from ..base.uids import base62_20
-from ..errors import FieldValidationError, ValidationError
+from ..errors import FieldValidationError, InvalidArgument, ValidationError
 from ..models._is_versioned import process_revises
 from ._is_versioned import IsVersioned
 from ._lineage import get_run, populate_recreating_run, track_run_inputs
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 
     import anndata as ad
     import pandas as pd
+    from polars import DataFrame as PolarsDataFrame
     from polars import LazyFrame as PolarsLazyFrame
     from pyarrow.dataset import Dataset as PyArrowDataset
 
@@ -398,6 +400,136 @@ class Collection(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
         if revises is not None and revises.uid != self.uid:
             track_run_inputs(revises, run=run)
         track_run_inputs(artifacts, run=run)
+
+    @classmethod
+    def from_dataframe(
+        cls,
+        df: pd.DataFrame | PolarsDataFrame | PolarsLazyFrame,
+        *,
+        key: str,
+        schema: Schema,
+        max_rows_per_shard: int = 1_000_000,
+        description: str | None = None,
+        run: Run | None = None,
+        revises: Collection | None = None,
+        branch: Branch | None = None,
+        space: Space | None = None,
+        parquet_kwargs: dict[str, Any] | None = None,
+        write_parquet_sorting_metadata: bool = False,
+    ) -> Collection:
+        """Create a schema-sharded collection of single-file Parquet artifacts.
+
+        Validates the whole dataframe before grouping by `schema.partition_by`.
+        Each artifact retains all columns, including the required partition
+        column, and contains only one distinct partition value. Null values
+        form their own group. Oversized groups are sliced without reordering.
+
+        Saves member artifacts and returns an unsaved collection; call `.save()`
+        to publish it. Storage writes are not transactional: failures can leave
+        saved artifacts, but never publish a partial collection.
+
+        Args:
+            df: A pandas or Polars dataframe. A Polars LazyFrame is collected once
+                before validation and grouping; this is not an out-of-core writer.
+            key: Collection key. Shard keys are `<key>/part-00000.parquet`, etc.
+            schema: A saved dataframe schema with exactly one `partition_by` feature.
+            max_rows_per_shard: Positive row limit per file, default one million.
+                This bounds rows, not bytes or peak memory.
+            description: Collection description.
+            run: The run creating the collection and its artifacts.
+            revises: An earlier collection version; otherwise inferred from `key`.
+            branch: Branch for the collection and artifacts.
+            space: Space for the collection and artifacts.
+            parquet_kwargs: Native backend Parquet writer options. Directory
+                partitioning options are not supported.
+            write_parquet_sorting_metadata: Opt in to verified per-shard sorting
+                metadata using `schema.sorted_by`. Does not sort the dataframe.
+        """
+        import pandas as pd
+
+        from ..core.storage.objects import is_polars_dataframe
+        from ..curators.core import DataFrameCurator
+        from .schema import Schema
+
+        if not isinstance(schema, Schema) or schema._state.adding:
+            raise InvalidArgument("Pass a saved Schema with partition_by")
+        if schema.partition_by is None:
+            raise InvalidArgument("Schema.partition_by must name a required column")
+        schema._validate_partition_by()
+        if (
+            isinstance(max_rows_per_shard, bool)
+            or not isinstance(max_rows_per_shard, int)
+            or max_rows_per_shard < 1
+        ):
+            raise InvalidArgument("max_rows_per_shard must be a positive integer")
+        if not isinstance(key, str) or not key.strip():
+            raise InvalidArgument("key must be a non-empty collection key")
+        if parquet_kwargs and {
+            "partition_cols",
+            "partition_by",
+            "partitioning",
+        }.intersection(parquet_kwargs):
+            raise InvalidArgument(
+                "Directory partitioning is not supported; use Schema.partition_by"
+            )
+        if write_parquet_sorting_metadata and not schema.sorted_by:
+            raise InvalidArgument("Sorting metadata requires schema.sorted_by")
+        is_polars = is_polars_dataframe(df)
+        if is_polars:
+            import polars as pl
+
+            if isinstance(df, pl.LazyFrame):
+                df = df.collect()
+        elif not isinstance(df, pd.DataFrame):
+            raise TypeError("df must be a pandas or Polars DataFrame or LazyFrame")
+        if len(df) == 0:
+            raise InvalidArgument("Cannot shard an empty dataframe")
+        # Validate before grouping so coercion determines keys and global
+        # uniqueness/order checks cannot be bypassed by splitting the data.
+        curator = DataFrameCurator(df, schema)
+        curator.validate()
+        df = curator.dataset
+        groups = (
+            df.partition_by(schema.partition_by, maintain_order=True)
+            if is_polars
+            else (
+                group
+                for _, group in df.groupby(
+                    df[schema.partition_by], sort=False, observed=True, dropna=False
+                )
+            )
+        )
+        artifacts = []
+        for group in groups:
+            for offset in range(0, len(group), max_rows_per_shard):
+                shard = (
+                    group.slice(offset, max_rows_per_shard)
+                    if is_polars
+                    else group.iloc[offset : offset + max_rows_per_shard]
+                )
+                artifact = Artifact.from_dataframe(
+                    shard,
+                    key=f"{key.rstrip('/')}/part-{len(artifacts):05d}.parquet",
+                    schema=schema,
+                    run=run,
+                    branch=branch,
+                    space=space,
+                    parquet_kwargs=parquet_kwargs,
+                    write_parquet_sorting_metadata=write_parquet_sorting_metadata,
+                    # Equal chunks must remain distinct members to preserve rows.
+                    skip_hash_lookup=True,
+                ).save()
+                artifacts.append(artifact)
+        return cls(
+            artifacts,
+            key=key,
+            schema=schema,
+            description=description,
+            run=run,
+            revises=revises,
+            branch=branch,
+            space=space,
+        )
 
     @strict_classmethod
     def get(
@@ -778,7 +910,14 @@ def from_artifacts(
         logger.warning(
             f"your collection contains artifacts with non-unique hashes:  {non_unique}"
         )
-    hash = hash_set(hashes_set)
+    if schema is not None and schema.partition_by is not None:
+        # Shards can have identical content; multiplicity is part of the dataset.
+        hash = hash_set(
+            [f"schema:{schema.hash}"]
+            + [f"{value}:{count}" for value, count in Counter(hashes).items()]
+        )
+    else:
+        hash = hash_set(hashes_set)
     return hash
 
 

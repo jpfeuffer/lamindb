@@ -812,6 +812,7 @@ def test_pandera_column_rules_and_parquet_sorting_metadata():
         ln.curators.DataFrameCurator(
             df.assign(rule_rank=[1, 2, 2, 1]), schema
         ).validate()
+    artifact.delete(permanent=True)
 
 
 @pytest.mark.parametrize(

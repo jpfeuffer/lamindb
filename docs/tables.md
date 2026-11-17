@@ -37,6 +37,81 @@ dataset
 
 We recommended to use {class}`~lamindb.Collection` to manage large-scale datasets as this gives you typical lakehouse guarantees. For more background, read {doc}`architecture`.
 
+### Create a schema-sharded collection
+
+Declare the sharding column once, in the shared schema. It must be a scalar
+column feature, included in the schema's required features (`minimal_set=True`,
+the default), not an optional feature or a dataframe index. Nullable partition
+features are supported: nulls form their own group.
+
+```{code-block} python
+import pandas as pd
+import lamindb as ln
+
+batch = ln.Feature(name="batch", dtype=str, nullable=True).save()
+measurement = ln.Feature(name="measurement", dtype=float).save()
+schema = ln.Schema(
+    [batch, measurement],
+    otype="DataFrame",
+    partition_by="batch",
+).save()
+
+df = pd.DataFrame({
+    "batch": ["a", "b", "a", None],
+    "measurement": [1.0, 2.0, 3.0, 4.0],
+})
+collection = ln.Collection.from_dataframe(
+    df,
+    key="measurements/by-batch",
+    schema=schema,
+    max_rows_per_shard=1_000_000,
+).save()
+```
+
+`Collection.from_dataframe` validates the whole input, including uniqueness and
+ordering rules, before grouping. It uses pandas `groupby` or Polars `partition_by`
+and writes ordinary single-file Parquet artifacts, each validated against the
+common schema. Every shard retains the partition column and contains only one
+distinct value of it. Observed categorical values (including Polars Enum) are
+supported; unused categories do not produce empty shards. Nulls are not dropped.
+Values are never encoded in paths: shard keys are
+`measurements/by-batch/part-00000.parquet`, etc., not Hive partitions.
+
+A group larger than `max_rows_per_shard` is sliced into multiple artifacts, each
+with the same partition value. The default limit is one million rows per file;
+it is not a byte-size or peak-memory guarantee. Group order follows first
+appearance, and row order within each group is preserved, but the original
+interleaving of groups is not. No sorting is performed. Existing
+`schema.sorted_by` validation remains active; optional
+`write_parquet_sorting_metadata=True` writes verified per-shard metadata, not
+a global sorting guarantee for the collection.
+
+Pandas DataFrames, Polars DataFrames, and Polars LazyFrames are accepted.
+LazyFrames are collected once before validation and grouping: this constructor
+is **not** an out-of-core ingestion API. Empty inputs raise an error rather
+than creating an empty collection.
+
+The constructor saves member artifacts and returns an unsaved collection.
+Calling `.save()` publishes a versioned collection; repeating the key with
+changed content creates a new version, following normal Collection conventions.
+Storage writes are not transactional: a failure may leave saved member artifacts,
+but no partial collection is published. Partition configuration persists in
+the schema's existing auxiliary metadata and contributes to its hash; no
+database migration is needed.
+
+Open or filter the collection as one logical table using the existing APIs:
+
+```{code-block} python
+import pyarrow.compute as pc
+
+table = collection.open().to_table(filter=pc.field("batch") == "a")
+
+import polars as pl
+
+with collection.open(engine="polars") as lazy_df:
+    table = lazy_df.filter(pl.col("batch").is_null()).collect()
+```
+
 <!-- #region -->
 
 :::{dropdown} Open sets of artifacts ad hoc

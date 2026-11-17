@@ -237,6 +237,51 @@ def _normalize_unique(unique: list[str] | None) -> list[str]:
     return list(unique)
 
 
+def _validate_partition_feature(
+    partition_by: str | None,
+    features: list[SQLRecord],
+    optional_features: list[Feature],
+    minimal_set: bool,
+    index: Feature | None,
+    otype: str | None,
+) -> None:
+    if partition_by is None:
+        return
+    if not isinstance(partition_by, str) or not partition_by.strip():
+        raise InvalidArgument("partition_by must be one non-empty feature name")
+    if otype not in {None, "DataFrame"}:
+        raise InvalidArgument("partition_by requires a dataframe schema")
+    feature = next(
+        (
+            feature
+            for feature in features
+            if isinstance(feature, Feature) and feature.name == partition_by
+        ),
+        None,
+    )
+    if (
+        feature is None
+        or not minimal_set
+        or feature in optional_features
+        or (index is not None and feature.uid == index.uid)
+    ):
+        raise InvalidArgument("partition_by must name a required column feature")
+    dtype = feature._dtype_str or ""
+    if dtype not in {
+        "str",
+        "path",
+        "url",
+        "bool",
+        "int",
+        "float",
+        "num",
+        "date",
+        "datetime",
+        "datetime64[ns, UTC]",
+    } and not dtype.startswith("cat"):
+        raise InvalidArgument("partition_by requires a scalar feature")
+
+
 def transfer_schema_members(
     schema: Schema,
     source_db: str,
@@ -541,6 +586,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
         unique: `list[str] | None = None` Column names whose combination must be unique per row.
         sorted_by: `list[str | tuple[str, bool]] | None = None` Required lexicographic row order.
             Strings mean ascending order; pairs specify `(column_name, ascending)`.
+        partition_by: `str | None = None` Required scalar feature used to shard dataframe collections.
         n_members: `int | None = None` A manual way of specifying the number of features in the schema. Is inferred from `features` if passed.
         branch: `Branch | None = None` A branch. If `None`, uses the current branch.
         space: `Space | None = None` A space. If omitted, follows the selection order below.
@@ -902,6 +948,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
         coerce: bool | None = None,
         unique: list[str] | None = None,
         sorted_by: list[str | tuple[str, bool]] | None = None,
+        partition_by: str | None = None,
         n_members: int | None = None,
         lookup: bool = True,
         branch: Branch | None = None,
@@ -944,6 +991,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
         maximal_set: bool = kwargs.pop("maximal_set", False)
         unique = _normalize_unique(kwargs.pop("unique", None))
         sorted_by = _normalize_sorted_by(kwargs.pop("sorted_by", None))
+        partition_by = kwargs.pop("partition_by", None)
         if "coerce_dtype" in kwargs:
             warnings.warn(
                 "`coerce_dtype` argument was renamed to `coerce` and will be removed in a future release.",
@@ -1004,6 +1052,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
             coerce=coerce_dtype,
             unique=unique,
             sorted_by=sorted_by,
+            partition_by=partition_by,
             n_features=n_features,
         )
         # pop before update_attributes/super so it never reaches Django fields or getattr
@@ -1074,6 +1123,25 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
         return _query_relatives([self], "schemas", depth=depth)  # type: ignore
 
     @property
+    def partition_by(self) -> str | None:
+        """Required column used by :meth:`~lamindb.Collection.from_dataframe`.
+
+        Persisted in schema configuration and included in its hash. This is a
+        collection sharding directive, not Hive directory partitioning.
+        """
+        return self._aux.get("partition_by") if self._aux else None
+
+    def _validate_partition_by(self) -> None:
+        _validate_partition_feature(
+            self.partition_by,
+            list(self.members),
+            list(self.optionals.get()),
+            self.minimal_set,
+            self.index,
+            self.otype,
+        )
+
+    @property
     def unique(self) -> list[str]:
         """Columns whose combination must be unique within a dataframe."""
         if not isinstance(self._aux, dict):
@@ -1112,6 +1180,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
         coerce: bool | None,
         unique: list[str],
         sorted_by: list[tuple[str, bool]],
+        partition_by: str | None,
         n_features: int | None,
         optional_features_manual: list[Feature] | None = None,
     ) -> tuple[list[Feature], dict[str, Any], list[Feature], Registry, bool]:
@@ -1188,6 +1257,9 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
                     assert optional_features_manual is None  # noqa: S101
                 if not optional_features and optional_features_manual is not None:
                     optional_features = optional_features_manual
+        _validate_partition_feature(
+            partition_by, features, optional_features, minimal_set, index, otype
+        )
         # n_features stays None if no features passed (flexible schema)
         if dtype is None:
             dtype = (
@@ -1232,6 +1304,8 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
         )
         coerce_default = False
         aux_dict: dict[str, Any] = {}
+        if partition_by is not None:
+            aux_dict["partition_by"] = partition_by
 
         # optional features (key "1") - remains in _aux
         if optional_features:
@@ -1266,6 +1340,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
             "suffix": "m",
             "unique": "o",
             "sorted_by": "p",
+            "partition_by": "q",
         }
         # we do not want pure informational annotations like otype, name, type,
         # is_type, or format constraints (`formats.zarr`) to be part of the hash
@@ -1285,6 +1360,8 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
             list_for_hashing.append(f"{HASH_CODE['unique']}={sorted(unique)!r}")
         if sorted_by:
             list_for_hashing.append(f"{HASH_CODE['sorted_by']}={sorted_by!r}")
+        if partition_by is not None:
+            list_for_hashing.append(f"{HASH_CODE['partition_by']}={partition_by!r}")
         if n_features is not None and n_features != n_features_default:
             list_for_hashing.append(f"{HASH_CODE['n']}={n_features}")
         if index is not None:
@@ -1561,6 +1638,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
                 coerce=self.coerce,
                 unique=self.unique,
                 sorted_by=self.sorted_by,
+                partition_by=self.partition_by,
                 n_features=self.n_members,
                 optional_features_manual=self.optionals.get(),
             )
