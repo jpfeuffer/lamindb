@@ -1127,7 +1127,7 @@ class Schema(SQLRecord, HasType, CanCurate, TracksRun, TracksUpdates):
         """Required column used by :meth:`~lamindb.Collection.from_dataframe`.
 
         Persisted in schema configuration and included in its hash. This is a
-        collection sharding directive, not Hive directory partitioning.
+        collection sharding directive, independent of the chosen storage layout.
         """
         return self._aux.get("partition_by") if self._aux else None
 

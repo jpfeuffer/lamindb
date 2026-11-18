@@ -404,10 +404,14 @@ class Collection(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
     @classmethod
     def from_dataframe(
         cls,
-        df: pd.DataFrame | PolarsDataFrame | PolarsLazyFrame,
+        df: pd.DataFrame
+        | PolarsDataFrame
+        | PolarsLazyFrame
+        | Iterable[pd.DataFrame | PolarsDataFrame],
         *,
         key: str,
         schema: Schema,
+        layout: Literal["plain", "hive"] = "plain",
         max_rows_per_shard: int = 1_000_000,
         description: str | None = None,
         run: Run | None = None,
@@ -419,7 +423,7 @@ class Collection(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
     ) -> Collection:
         """Create a schema-sharded collection of single-file Parquet artifacts.
 
-        Validates the whole dataframe before grouping by `schema.partition_by`.
+        Validates input before grouping by `schema.partition_by`.
         Each artifact retains all columns, including the required partition
         column, and contains only one distinct partition value. Null values
         form their own group. Oversized groups are sliced without reordering.
@@ -429,10 +433,16 @@ class Collection(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
         saved artifacts, but never publish a partial collection.
 
         Args:
-            df: A pandas or Polars dataframe. A Polars LazyFrame is collected once
-                before validation and grouping; this is not an out-of-core writer.
-            key: Collection key. Shard keys are `<key>/part-00000.parquet`, etc.
+            df: A pandas or Polars dataframe, a Polars LazyFrame (collected once),
+                or a one-pass iterable of eager batches from the same backend.
+                Batches are grouped and written independently. Global uniqueness
+                retains only the relevant columns; global sorting checks adjacent
+                batch boundaries in source order.
+            key: Collection key.
             schema: A saved dataframe schema with exactly one `partition_by` feature.
+            layout: `plain` uses virtual shard keys. `hive` stores the original
+                shard files at `<key>/<write-id>/<column>=<value>/part-*.parquet`.
+                Each write uses a separate directory.
             max_rows_per_shard: Positive row limit per file, default one million.
                 This bounds rows, not bytes or peak memory.
             description: Collection description.
@@ -446,14 +456,19 @@ class Collection(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
                 metadata using `schema.sorted_by`. Does not sort the dataframe.
         """
         import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
 
+        from ..core.storage._hive import hive_directory
         from ..core.storage.objects import is_polars_dataframe
+        from ..curators._streaming import StreamChecks
         from ..curators.core import DataFrameCurator
         from .schema import Schema
 
         if not isinstance(schema, Schema) or schema._state.adding:
             raise InvalidArgument("Pass a saved Schema with partition_by")
-        if schema.partition_by is None:
+        column = schema.partition_by
+        if column is None:
             raise InvalidArgument("Schema.partition_by must name a required column")
         schema._validate_partition_by()
         if (
@@ -464,6 +479,19 @@ class Collection(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
             raise InvalidArgument("max_rows_per_shard must be a positive integer")
         if not isinstance(key, str) or not key.strip():
             raise InvalidArgument("key must be a non-empty collection key")
+        if layout not in {"plain", "hive"}:
+            raise InvalidArgument("layout must be 'plain' or 'hive'")
+        if layout == "hive":
+            from pathlib import PurePosixPath
+
+            path = PurePosixPath(key)
+            if (
+                path.is_absolute()
+                or not path.parts
+                or ".." in path.parts
+                or any(c in key for c in "\\\x00?#:")
+            ):
+                raise InvalidArgument("Hive layout requires a relative storage key")
         if parquet_kwargs and {
             "partition_cols",
             "partition_by",
@@ -474,52 +502,114 @@ class Collection(SQLRecord, IsVersioned, TracksRun, TracksUpdates):
             )
         if write_parquet_sorting_metadata and not schema.sorted_by:
             raise InvalidArgument("Sorting metadata requires schema.sorted_by")
-        is_polars = is_polars_dataframe(df)
-        if is_polars:
+        if is_polars_dataframe(df):
             import polars as pl
 
             if isinstance(df, pl.LazyFrame):
                 df = df.collect()
-        elif not isinstance(df, pd.DataFrame):
-            raise TypeError("df must be a pandas or Polars DataFrame or LazyFrame")
-        if len(df) == 0:
-            raise InvalidArgument("Cannot shard an empty dataframe")
-        # Validate before grouping so coercion determines keys and global
-        # uniqueness/order checks cannot be bypassed by splitting the data.
-        curator = DataFrameCurator(df, schema)
-        curator.validate()
-        df = curator.dataset
-        groups = (
-            df.partition_by(schema.partition_by, maintain_order=True)
-            if is_polars
-            else (
-                group
-                for _, group in df.groupby(
-                    df[schema.partition_by], sort=False, observed=True, dropna=False
+        streaming = not (isinstance(df, pd.DataFrame) or is_polars_dataframe(df))
+        if streaming and isinstance(df, (str, bytes)):
+            raise TypeError(
+                "df must be a dataframe or an iterable of dataframe batches"
+            )
+        batches = iter(df) if streaming else iter((df,))
+        checks = None
+        parquet_schema = None
+        partition_paths: dict[str, str] = {}
+        hive_root = f"{key.rstrip('/')}/{base62_20()}" if layout == "hive" else None
+        artifacts: list[Artifact] = []
+        for batch in batches:
+            is_pandas = isinstance(batch, pd.DataFrame)
+            is_polars = is_polars_dataframe(batch)
+            if is_polars:
+                import polars as pl
+
+                is_polars = isinstance(batch, pl.DataFrame)
+            if not (is_pandas or is_polars):
+                raise TypeError(
+                    "Each batch must be an eager pandas or Polars DataFrame"
+                )
+            if checks is not None and checks.is_polars != is_polars:
+                raise InvalidArgument("Dataframe batches must use the same backend")
+            if len(batch) == 0:
+                continue
+            # Validate before grouping so coercion determines keys and global
+            # uniqueness/order checks cannot be bypassed by splitting the data.
+            curator = DataFrameCurator(batch, schema)
+            curator.validate()
+            frame = curator.dataset
+            if streaming:
+                if checks is None:
+                    checks = StreamChecks(schema, is_polars=is_polars)
+                checks.add(frame)
+            groups = (
+                frame.partition_by(column, maintain_order=True)
+                if is_polars
+                else (
+                    group
+                    for _, group in frame.groupby(
+                        frame[column], sort=False, observed=True, dropna=False
+                    )
                 )
             )
-        )
-        artifacts = []
-        for group in groups:
-            for offset in range(0, len(group), max_rows_per_shard):
-                shard = (
-                    group.slice(offset, max_rows_per_shard)
-                    if is_polars
-                    else group.iloc[offset : offset + max_rows_per_shard]
-                )
-                artifact = Artifact.from_dataframe(
-                    shard,
-                    key=f"{key.rstrip('/')}/part-{len(artifacts):05d}.parquet",
-                    schema=schema,
-                    run=run,
-                    branch=branch,
-                    space=space,
-                    parquet_kwargs=parquet_kwargs,
-                    write_parquet_sorting_metadata=write_parquet_sorting_metadata,
-                    # Equal chunks must remain distinct members to preserve rows.
-                    skip_hash_lookup=True,
-                ).save()
-                artifacts.append(artifact)
+            for group in groups:
+                prefix = key.rstrip("/")
+                if hive_root is not None:
+                    from unicodedata import normalize
+
+                    first = group[column].head(1)
+                    value = first.to_arrow()[0] if is_polars else pa.array(first)[0]
+                    directory = hive_directory(column, value)
+                    folded = normalize("NFD", directory).casefold()
+                    if partition_paths.setdefault(folded, directory) != directory:
+                        raise ValidationError(
+                            "Hive paths collide on a case-insensitive filesystem"
+                        )
+                    prefix = f"{hive_root}/{directory}"
+                for offset in range(0, len(group), max_rows_per_shard):
+                    shard = (
+                        group.slice(offset, max_rows_per_shard)
+                        if is_polars
+                        else group.iloc[offset : offset + max_rows_per_shard]
+                    )
+                    artifact = Artifact.from_dataframe(
+                        shard,
+                        key=f"{prefix}/part-{len(artifacts):05d}.parquet",
+                        schema=schema,
+                        run=run,
+                        branch=branch,
+                        space=space,
+                        parquet_kwargs=parquet_kwargs,
+                        write_parquet_sorting_metadata=write_parquet_sorting_metadata,
+                        key_is_virtual=hive_root is None,
+                        # Equal chunks must remain distinct members to preserve rows.
+                        skip_hash_lookup=True,
+                    )
+                    if streaming or hive_root is not None:
+                        with pq.ParquetFile(artifact._local_filepath) as parquet:
+                            current = parquet.schema_arrow
+                            if hive_root is not None:
+                                stored = next(
+                                    parquet.iter_batches(batch_size=1, columns=[column])
+                                )
+                                if (
+                                    hive_directory(column, stored.column(0)[0])
+                                    != directory
+                                ):
+                                    raise ValidationError(
+                                        "Written partition value does not match the Hive path"
+                                    )
+                        if parquet_schema is None:
+                            parquet_schema = current
+                        elif not parquet_schema.equals(current):
+                            raise ValidationError(
+                                "Parquet shard columns or types differ"
+                            )
+                    artifacts.append(artifact.save())
+        if not artifacts:
+            raise InvalidArgument("Cannot shard an empty dataframe")
+        if checks is not None:
+            checks.finish()
         return cls(
             artifacts,
             key=key,
@@ -914,6 +1004,7 @@ def from_artifacts(
         # Shards can have identical content; multiplicity is part of the dataset.
         hash = hash_set(
             [f"schema:{schema.hash}"]
+            + (["layout:hive"] if all(not a._key_is_virtual for a in artifacts) else [])
             + [f"{value}:{count}" for value, count in Counter(hashes).items()]
         )
     else:

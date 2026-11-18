@@ -68,14 +68,15 @@ collection = ln.Collection.from_dataframe(
 ).save()
 ```
 
-`Collection.from_dataframe` validates the whole input, including uniqueness and
-ordering rules, before grouping. It uses pandas `groupby` or Polars `partition_by`
+For a single dataframe, `Collection.from_dataframe` validates the whole input,
+including uniqueness and ordering rules, before grouping. It uses pandas
+`groupby` or Polars `partition_by`
 and writes ordinary single-file Parquet artifacts, each validated against the
 common schema. Every shard retains the partition column and contains only one
 distinct value of it. Observed categorical values (including Polars Enum) are
 supported; unused categories do not produce empty shards. Nulls are not dropped.
-Values are never encoded in paths: shard keys are
-`measurements/by-batch/part-00000.parquet`, etc., not Hive partitions.
+In the default `plain` layout, virtual shard keys are
+`measurements/by-batch/part-00000.parquet`, etc., with no partition values in them.
 
 A group larger than `max_rows_per_shard` is sliced into multiple artifacts, each
 with the same partition value. The default limit is one million rows per file;
@@ -87,9 +88,14 @@ interleaving of groups is not. No sorting is performed. Existing
 a global sorting guarantee for the collection.
 
 Pandas DataFrames, Polars DataFrames, and Polars LazyFrames are accepted.
-LazyFrames are collected once before validation and grouping: this constructor
-is **not** an out-of-core ingestion API. Empty inputs raise an error rather
-than creating an empty collection.
+A single LazyFrame is collected once before validation and grouping. For
+streaming ingestion, pass an iterator of eager batches from one backend (for
+example, `pd.read_csv("measurements.csv", chunksize=100_000)`). Each batch is
+validated, grouped, and written independently; a value that appears in several
+batches gets several shards. Sorting checks adjacent batch boundaries in source
+order. Global uniqueness retains only the relevant columns or index, so memory
+for those constraints still grows with the number of rows. All nonempty batches
+must produce the same Parquet columns and types. Empty inputs raise an error.
 
 The constructor saves member artifacts and returns an unsaved collection.
 Calling `.save()` publishes a versioned collection; repeating the key with
@@ -111,6 +117,40 @@ import polars as pl
 with collection.open(engine="polars") as lazy_df:
     table = lazy_df.filter(pl.col("batch").is_null()).collect()
 ```
+
+#### Write a managed Hive layout
+
+Pass `layout="hive"` at ingestion to store the original shards under
+`<key>/<write-id>/batch=<value>/part-*.parquet`, with one directory root per
+write. Both layouts write one managed file per shard, not a second exported
+copy. The partition column stays in every file. `Collection.open()` uses the
+member files directly regardless of layout.
+
+```{code-block} python
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+batches = pd.read_csv("measurements.csv", chunksize=100_000)
+hive = ln.Collection.from_dataframe(
+    batches, key="measurements", schema=schema, layout="hive"
+).save()
+shard = hive.ordered_artifacts.all()[0].path  # local storage example
+partition = ds.partitioning(
+    pa.schema([pq.read_schema(shard).field("batch")]),
+    flavor="hive",
+    dictionaries="infer",
+)
+dataset = ds.dataset(shard.parent.parent, format="parquet", partitioning=partition)
+```
+
+For directory reads with Hive pruning, use a partition schema matching the
+physical Arrow field; default inference can choose an incompatible type. To read
+the same directory using only file values, pass `partitioning=None`. Hive uses
+`__HIVE_DEFAULT_PARTITION__` for null and rejects literal values that cannot
+round-trip through a Hive path. If Arrow needs to unify dictionaries containing
+nulls for a later operation, read the files without Hive inference or cast the
+partition column to its underlying value type before that operation.
 
 <!-- #region -->
 

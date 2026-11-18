@@ -1,5 +1,7 @@
 import lamindb as ln
 import pandas as pd
+import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pytest
 from django.db import transaction
@@ -100,6 +102,147 @@ def test_polars_enum():
     assert collection.open().count_rows() == 4
     with collection.open(engine="polars") as lazy:
         assert lazy.collect().schema["shard_group"] == df.schema["shard_group"]
+
+
+@pytest.mark.parametrize("layout", ["plain", "hive"])
+def test_streaming_layout(backend, layout):
+    schema = make_schema(unique=["shard_value"], sorted_by=["shard_value"])
+    frame = pd.DataFrame(
+        {"shard_group": ["a/b %", None, "a/b %", "b"], "shard_value": range(4)}
+    )
+    if type(backend(frame)).__name__ == "LazyFrame":
+        pytest.skip("Batches are eager")
+    key = f"streaming/{layout}"
+
+    def batches():
+        yield backend(frame.iloc[:2])
+        assert ln.Artifact.filter(key__startswith=f"{key}/").count() == 2
+        yield backend(frame.iloc[2:])
+
+    collection = ln.Collection.from_dataframe(
+        batches(), key=key, schema=schema, layout=layout
+    ).save()
+    paths = [a.path for a in collection.ordered_artifacts]
+    assert len(set(paths)) == 4
+    result = collection.open().to_table().sort_by("shard_value")
+    assert result["shard_group"].to_pylist() == ["a/b %", None, "a/b %", "b"]
+    if layout == "hive":
+        root = paths[0].parent.parent
+        assert set(root.rglob("*.parquet")) == set(paths)
+        assert paths[0].parent.name == "shard_group=a%2Fb%20%25"
+        assert paths[1].parent.name == "shard_group=__HIVE_DEFAULT_PARTITION__"
+        field = pq.read_schema(paths[0]).field("shard_group")
+        hive = ds.dataset(
+            root,
+            format="parquet",
+            partitioning=ds.partitioning(pa.schema([field]), flavor="hive"),
+        )
+        assert hive.to_table().sort_by("shard_value").equals(result)
+        assert (
+            len(list(hive.get_fragments(filter=ds.field("shard_group") == "a/b %")))
+            == 2
+        )
+
+
+@pytest.mark.parametrize(
+    "rule,match",
+    [("unique", "Duplicate values across"), ("sorted_by", "not sorted across")],
+)
+def test_streaming_cross_batch_validation(backend, rule, match):
+    schema = make_schema(**{rule: ["shard_value"]})
+    first = backend(pd.DataFrame({"shard_group": ["a"], "shard_value": [2]}))
+    second = backend(
+        pd.DataFrame(
+            {"shard_group": ["b"], "shard_value": [2 if rule == "unique" else 1]}
+        )
+    )
+    if type(first).__name__ == "LazyFrame":
+        pytest.skip("Batches are eager")
+    with pytest.raises(ValidationError, match=match):
+        ln.Collection.from_dataframe(iter([first, second]), key="bad", schema=schema)
+    assert not ln.Collection.filter(key="bad").exists()
+
+
+def test_hive_versions_and_layout_identity():
+    schema = make_schema()
+    frame = pd.DataFrame({"shard_group": ["a"], "shard_value": [1]})
+    plain = ln.Collection.from_dataframe(frame, key="managed", schema=schema).save()
+    hive = ln.Collection.from_dataframe(
+        frame, key="managed", schema=schema, layout="hive"
+    ).save()
+    updated = ln.Collection.from_dataframe(
+        frame.assign(shard_value=2), key="managed", schema=schema, layout="hive"
+    ).save()
+    assert len({plain.uid, hive.uid, updated.uid}) == 3
+    root = hive.ordered_artifacts.all()[0].path.parent.parent
+    assert updated.ordered_artifacts.all()[0].path.parent.parent != root
+    assert hive.open().to_table()["shard_value"].to_pylist() == [1]
+    assert updated.open().to_table()["shard_value"].to_pylist() == [2]
+
+
+@pytest.mark.parametrize("dtype", ["Int64", "category", "enum"])
+def test_hive_partition_types(dtype):
+    values = [2**40, None, 2**40] if dtype == "Int64" else ["a", None, "a"]
+    group = ln.Feature(
+        name="shard_group", dtype=int if dtype == "Int64" else str
+    ).save()
+    value = ln.Feature(name="shard_value", dtype=int).save()
+    schema = ln.Schema([group, value], partition_by=group.name).save()
+    if dtype == "enum":
+        pl = pytest.importorskip("polars")
+        frame = pl.DataFrame(
+            {
+                group.name: pl.Series(values, dtype=pl.Enum(["a", "unused"])),
+                value.name: range(3),
+            }
+        )
+    else:
+        frame = pd.DataFrame(
+            {group.name: pd.Series(values, dtype=dtype), value.name: range(3)}
+        )
+    collection = ln.Collection.from_dataframe(
+        frame, key=f"managed/{dtype}", schema=schema, layout="hive"
+    ).save()
+    shard = collection.ordered_artifacts.all()[0].path
+    field = pq.read_schema(shard).field(group.name)
+    if dtype == "Int64":
+        assert field.type == pa.int64()
+    partitioning = ds.partitioning(
+        pa.schema([field]), flavor="hive", dictionaries="infer"
+    )
+    table = ds.dataset(
+        shard.parent.parent, format="parquet", partitioning=partitioning
+    ).to_table()
+    assert dict(
+        zip(table[value.name].to_pylist(), table[group.name].to_pylist())
+    ) == dict(enumerate(values))
+    assert (
+        collection.open().to_table().sort_by(value.name)[group.name].to_pylist()
+        == values
+    )
+
+
+def test_hive_reserved_null_value():
+    schema = make_schema()
+    frame = pd.DataFrame(
+        {"shard_group": ["__HIVE_DEFAULT_PARTITION__"], "shard_value": [1]}
+    )
+    with pytest.raises(ValidationError, match="cannot round-trip"):
+        ln.Collection.from_dataframe(
+            frame, key="managed/null", schema=schema, layout="hive"
+        )
+    assert not ln.Artifact.filter(key__startswith="managed/null/").exists()
+
+
+def test_streaming_feature_uniqueness():
+    group = ln.Feature(name="shard_group", dtype=str).save()
+    value = ln.Feature(name="shard_value", dtype=int, unique=True).save()
+    schema = ln.Schema([group, value], partition_by=group.name).save()
+    frames = [
+        pd.DataFrame({"shard_group": [name], "shard_value": [1]}) for name in ("a", "b")
+    ]
+    with pytest.raises(ValidationError, match="Duplicate values across"):
+        ln.Collection.from_dataframe(frames, key="managed/unique", schema=schema)
 
 
 def test_schema_partition_config():
